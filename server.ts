@@ -5,13 +5,14 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import { BIG_SISTER_SYSTEM_INSTRUCTION } from './server/systemPrompt.ts';
+import { generateSisterResponse, getAIProviderConfig } from './server/aiAdapter.ts';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
+export const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // Body parser limits for image uploads (up to 10MB json payload)
@@ -19,10 +20,12 @@ app.use(express.json({ limit: '10mb' }));
 
 // Health check endpoint
 app.get('/api/health', (_req, res) => {
+  const providerConfig = getAIProviderConfig();
   res.json({
     status: 'ok',
-    hasApiKey: !!process.env.GEMINI_API_KEY,
-    model: 'gemini-3.8-flash',
+    hasApiKey: providerConfig.provider !== 'none',
+    provider: providerConfig.provider,
+    model: providerConfig.primaryModel,
     timestamp: new Date().toISOString(),
   });
 });
@@ -163,66 +166,14 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.error('GEMINI_API_KEY is not configured in environment variables');
+    const providerConfig = getAIProviderConfig();
+    if (providerConfig.provider === 'none') {
+      console.error('No API key configured (neither GEMINI_API_KEY nor OPENROUTER_API_KEY)');
       return res.status(503).json({
-        error: 'The AI assistant service is temporarily not configured. Please ensure your GEMINI_API_KEY is set in Settings > Secrets.',
+        error: 'The AI assistant service is temporarily not configured. Please ensure your GEMINI_API_KEY or OPENROUTER_API_KEY is configured in your environment variables.',
         canRetry: true,
       });
     }
-
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
-    // Assemble conversation contents
-    const contents: any[] = [];
-
-    // Keep only the last 12 turns of active conversation to maintain coherence without token waste
-    const recentHistory = Array.isArray(history) ? history.slice(-12) : [];
-
-    for (const turn of recentHistory) {
-      if (turn && turn.text && (turn.role === 'user' || turn.role === 'model')) {
-        contents.push({
-          role: turn.role,
-          parts: [{ text: String(turn.text) }],
-        });
-      }
-    }
-
-    // Prepare current user turn
-    const currentParts: any[] = [];
-
-    if (image && image.data && image.mimeType) {
-      const cleanBase64 = image.data.replace(/^data:image\/\w+;base64,/, '');
-      currentParts.push({
-        inlineData: {
-          mimeType: image.mimeType,
-          data: cleanBase64,
-        },
-      });
-    }
-
-    if (message && String(message).trim()) {
-      currentParts.push({
-        text: String(message).trim(),
-      });
-    } else if (image) {
-      currentParts.push({
-        text: 'Please review this receipt or bill image. Distinguish visible facts from uncertain items, and let me know what you can clearly identify. Warn me if sensitive details are visible.',
-      });
-    }
-
-    contents.push({
-      role: 'user',
-      parts: currentParts,
-    });
 
     // Prepare system instruction with persona styling if chosen
     let systemInstruction = BIG_SISTER_SYSTEM_INSTRUCTION;
@@ -232,58 +183,34 @@ app.post('/api/chat', async (req, res) => {
       systemInstruction += '\n\n[STYLE PREFERENCE]: Use a more conversational, approachable tone while strictly adhering to non-judgment, accuracy, and clear choices.';
     }
 
-    // Model priority order: primary is gemini-3.8-flash; fallback to gemini-3.1-flash-lite or gemini-flash-latest during demand spikes
-    const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
-    let lastError: any = null;
-    let replyText = '';
+    // Keep only the last 12 turns of active conversation to maintain coherence without token waste
+    const recentHistory = Array.isArray(history) ? history.slice(-12) : [];
 
-    for (const modelName of candidateModels) {
-      try {
-        console.log(`Attempting generateContent with model: ${modelName}`);
-        const responsePromise = ai.models.generateContent({
-          model: modelName,
-          contents,
-          config: {
-            systemInstruction,
-            temperature: 0.65,
-          },
-        });
-
-        // 18s timeout per attempt
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Timeout with ${modelName}`)), 18000)
-        );
-
-        const response: any = await Promise.race([responsePromise, timeoutPromise]);
-        if (response && response.text) {
-          replyText = response.text;
-          console.log(`Successfully generated reply with model: ${modelName}`);
-          break;
-        }
-      } catch (err: any) {
-        console.warn(`Model ${modelName} failed or timed out:`, err?.message || err);
-        lastError = err;
-        // Continue to fallback model
-      }
-    }
-
-    if (!replyText && lastError) {
-      throw lastError;
-    }
+    const result = await generateSisterResponse({
+      message: message ? String(message) : undefined,
+      history: recentHistory,
+      image,
+      systemInstruction,
+      personaStyle,
+    });
 
     return res.json({
-      reply: replyText,
+      reply: result.text,
+      provider: result.provider,
+      modelUsed: result.modelUsed,
       success: true,
     });
   } catch (error: any) {
-    console.error('Gemini API Error in /api/chat:', error?.message || error);
+    console.error('API Error in /api/chat:', error?.message || error);
 
     // Provide friendly, non-blaming error messages to user
     let userMessage = "I ran into a temporary connection issue while thinking through this. Let's try again in a moment.";
-    if (error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')) {
+    if (error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED') || error?.message?.includes('rate limit')) {
       userMessage = "We've hit a brief rate limit with the AI service. Take a quick breath and click Retry in a few seconds.";
     } else if (error?.status === 400 || error?.message?.includes('INVALID_ARGUMENT')) {
       userMessage = "The request couldn't be processed. If you uploaded an image, please try a clearer or smaller image, or type the details directly.";
+    } else if (error?.message?.includes('API key') || error?.message?.includes('unauthorized') || error?.status === 401) {
+      userMessage = "There seems to be an issue verifying the configured API key. Please check your environment variables.";
     }
 
     return res.status(500).json({
