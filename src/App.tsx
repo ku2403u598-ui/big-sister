@@ -162,12 +162,33 @@ export default function App() {
         }),
       });
 
-      const data = await res.json();
+      let data: any = null;
+      let rawText = '';
+      try {
+        rawText = await res.text();
+        data = JSON.parse(rawText);
+      } catch {
+        // Raw text was not JSON (e.g. gateway error or HTML page)
+      }
 
-      if (!res.ok || !data.success) {
-        const errorText =
-          data.error ||
-          "I ran into a temporary issue thinking through that. Let's try sending it again.";
+      if (!res.ok || !data?.success) {
+        let errorText = data?.error;
+        if (!errorText) {
+          if (res.status === 401) {
+            errorText = "Your API key could not be authenticated. Please verify your OPENROUTER_API_KEY or GEMINI_API_KEY in environment variables.";
+          } else if (res.status === 503) {
+            errorText = "The AI service is not configured yet. Please add OPENROUTER_API_KEY or GEMINI_API_KEY to your environment variables.";
+          } else if (res.status === 504) {
+            errorText = "The AI model took too long to respond. Please click retry to try again.";
+          } else if (res.status === 404) {
+            errorText = "The API route was not found (404). If deployed on Vercel, please check function logs.";
+          } else if (res.status >= 500) {
+            errorText = "The server encountered an issue processing your request. Please check that your API key has credits and is active.";
+          } else {
+            errorText = "I ran into a temporary issue thinking through that. Let's try sending it again.";
+          }
+        }
+
         setMessages((prev) => [
           ...prev,
           {
@@ -196,12 +217,17 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('Network or server error during chat:', err);
+      const isOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+      const errorText = isOffline
+        ? "You appear to be offline. Please check your internet connection and click retry below."
+        : "Couldn't reach the chat service. If running on Vercel, please verify OPENROUTER_API_KEY is saved in your Vercel Project Settings > Environment Variables.";
+
       setMessages((prev) => [
         ...prev,
         {
           id: `error-${Date.now()}`,
           role: 'model',
-          text: "We couldn't reach the server right now. Check your internet connection and click retry below.",
+          text: errorText,
           timestamp: Date.now(),
           isError: true,
         },

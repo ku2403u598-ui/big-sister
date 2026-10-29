@@ -30,14 +30,14 @@ export interface GenerateResult {
  * 1:1 Model Mapping Specification:
  * Ensures exact functional, generational, and fallback equivalence
  * between Google Native and OpenRouter.
- * Note: Only actively supported models are included to avoid 404/410 errors.
  */
 export interface UnifiedModelTier {
   id: string;
   name: string;
   nativeModels: string[]; // Active Google native API model identifiers
   openRouterModels: string[]; // OpenRouter model identifiers
-  timeoutMs: number;
+  nativeTimeoutMs: number;
+  openRouterTimeoutMs: number;
 }
 
 export const UNIFIED_MODEL_TIERS: UnifiedModelTier[] = [
@@ -46,41 +46,63 @@ export const UNIFIED_MODEL_TIERS: UnifiedModelTier[] = [
     name: 'Gemini Flash Primary (Latest Reasoning)',
     nativeModels: ['gemini-3.8-flash'],
     openRouterModels: ['google/gemini-2.5-flash'],
-    timeoutMs: 8000, // Quick 8s check; if high-demand spike (503) or slow, quickly cascade to Tier 2
+    nativeTimeoutMs: 8000, // Quick 8s check in AI Studio; if high-demand spike (503), rapidly cascade to Tier 2
+    openRouterTimeoutMs: 35000, // OpenRouter needs ample time to proxy & stream back tokens
   },
   {
     id: 'tier-2-secondary',
     name: 'Gemini Flash Lite (High-Throughput & Resilient)',
     nativeModels: ['gemini-3.1-flash-lite'],
     openRouterModels: ['google/gemini-2.0-flash-001'],
-    timeoutMs: 25000,
+    nativeTimeoutMs: 25000,
+    openRouterTimeoutMs: 35000,
   },
   {
     id: 'tier-3-tertiary',
     name: 'Gemini Flash Stable Fallback',
     nativeModels: ['gemini-flash-latest'],
     openRouterModels: ['google/gemini-flash-1.5'],
-    timeoutMs: 25000,
+    nativeTimeoutMs: 25000,
+    openRouterTimeoutMs: 35000,
   },
 ];
 
 /**
+ * Sanitizes an API key string, stripping any accidental surrounding quotes or whitespace
+ */
+function cleanKey(raw?: string): string {
+  if (!raw) return '';
+  return raw.trim().replace(/^["']|["']$/g, '').trim();
+}
+
+/**
  * Inspects environment variables to determine provider.
- * Automatically detects whether the user provided an OpenRouter key
- * (via OPENROUTER_API_KEY or a GEMINI_API_KEY starting with 'sk-or-').
+ * Supports OPENROUTER_API_KEY, GEMINI_API_KEY, and common casing variations.
  */
 export function getAIProviderConfig(): {
   provider: 'openrouter' | 'google-native' | 'none';
   apiKey: string;
   primaryModel: string;
 } {
-  const openRouterKey = process.env.OPENROUTER_API_KEY;
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const openRouterRaw =
+    process.env.OPENROUTER_API_KEY ||
+    process.env.OPEN_ROUTER_API_KEY ||
+    process.env.OPENROUTER_KEY ||
+    process.env.VITE_OPENROUTER_API_KEY;
 
-  if (openRouterKey || (geminiKey && geminiKey.startsWith('sk-or-'))) {
+  const geminiRaw =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GEMINI_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY;
+
+  const openRouterKey = cleanKey(openRouterRaw);
+  const geminiKey = cleanKey(geminiRaw);
+
+  // If OpenRouter key is provided, or if GEMINI_API_KEY starts with 'sk-or-', route to OpenRouter
+  if (openRouterKey || geminiKey.startsWith('sk-or-')) {
     return {
       provider: 'openrouter',
-      apiKey: openRouterKey || geminiKey!,
+      apiKey: openRouterKey || geminiKey,
       primaryModel: UNIFIED_MODEL_TIERS[0].openRouterModels[0],
     };
   }
@@ -166,10 +188,10 @@ async function callOpenRouterTiers(
   for (const tier of UNIFIED_MODEL_TIERS) {
     for (const modelName of tier.openRouterModels) {
       try {
-        console.log(`[OpenRouter] Trying ${tier.id} using model: ${modelName}`);
+        console.log(`[OpenRouter] Trying ${tier.id} using model: ${modelName} (timeout: ${tier.openRouterTimeoutMs}ms)`);
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), tier.timeoutMs);
+        const timeoutId = setTimeout(() => controller.abort(), tier.openRouterTimeoutMs);
 
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
@@ -192,7 +214,14 @@ async function callOpenRouterTiers(
         if (!response.ok) {
           const errText = await response.text();
           console.warn(`[OpenRouter] Model ${modelName} returned status ${response.status}: ${errText}`);
-          lastError = new Error(`OpenRouter (${modelName}) returned ${response.status}: ${errText}`);
+          let parsed: any;
+          try {
+            parsed = JSON.parse(errText);
+          } catch {
+            // ignore
+          }
+          const detailedMsg = parsed?.error?.message || errText;
+          lastError = new Error(`OpenRouter (${modelName}) returned ${response.status}: ${detailedMsg}`);
           continue;
         }
 
@@ -277,7 +306,7 @@ async function callGoogleNativeTiers(
   for (const tier of UNIFIED_MODEL_TIERS) {
     for (const modelName of tier.nativeModels) {
       try {
-        console.log(`[GoogleNative] Trying ${tier.id} using model: ${modelName}`);
+        console.log(`[GoogleNative] Trying ${tier.id} using model: ${modelName} (timeout: ${tier.nativeTimeoutMs}ms)`);
 
         const responsePromise = ai.models.generateContent({
           model: modelName,
@@ -288,9 +317,8 @@ async function callGoogleNativeTiers(
           },
         });
 
-        // Fast failover timeout: 8s on Tier 1 so demand spikes (503s/slowdowns) immediately try Tier 2 (3.1-flash-lite)
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Timeout with ${modelName} after ${tier.timeoutMs}ms`)), tier.timeoutMs)
+          setTimeout(() => reject(new Error(`Timeout with ${modelName} after ${tier.nativeTimeoutMs}ms`)), tier.nativeTimeoutMs)
         );
 
         const response: any = await Promise.race([responsePromise, timeoutPromise]);
@@ -306,7 +334,6 @@ async function callGoogleNativeTiers(
       } catch (err: any) {
         console.warn(`[GoogleNative] Model ${modelName} failed or timed out:`, err?.message || err);
         lastError = err;
-        // Continue to the next tier immediately
       }
     }
   }
@@ -323,7 +350,7 @@ export async function generateSisterResponse(options: GenerateOptions): Promise<
 
   if (config.provider === 'none') {
     throw new Error(
-      'No AI API key is configured. Please provide GEMINI_API_KEY (from Google) or OPENROUTER_API_KEY (from OpenRouter).'
+      'No AI API key is configured. Please provide OPENROUTER_API_KEY (from OpenRouter) or GEMINI_API_KEY (from Google) in your environment variables.'
     );
   }
 

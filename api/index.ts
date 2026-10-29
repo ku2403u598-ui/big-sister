@@ -1,4 +1,4 @@
-import { app } from '../server';
+import { app } from '../server/app.ts';
 
-// Vercel serverless function export
+// Export Express app as a Vercel Serverless Function
 export default app;
