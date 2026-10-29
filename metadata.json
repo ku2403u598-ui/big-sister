@@ -1,0 +1,6 @@
+{
+  "name": "The Big Sister - Adulting & Budgeting Companion",
+  "description": "A warm, non-judgmental conversational adulting companion for young adults in India learning to manage money and everyday responsibilities.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
